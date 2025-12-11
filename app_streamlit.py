@@ -1,6 +1,4 @@
 import streamlit as st
-import cv2
-import numpy as np
 import tempfile
 
 from segmentation_core import analyze_image
