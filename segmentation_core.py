@@ -33,10 +33,8 @@ def remove_hair(image_bgr: np.ndarray):
 def kmeans_lesion_mask(image_bgr: np.ndarray) -> np.ndarray:
     h, w = image_bgr.shape[:2]
 
-    # Згладжуємо шум
     blurred = cv2.GaussianBlur(image_bgr, (5, 5), 0)
 
-    # Переходимо в Lab — там канал L добре відокремлює “темне/світле”
     lab = cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
     lab_reshaped = lab.reshape(-1, 3).astype(np.float32)
 
@@ -147,7 +145,6 @@ def detect_coin_ppm(image_bgr: np.ndarray, real_d_mm=COIN_DIAMETER_MM):
     circles = np.uint16(np.around(circles))
     x, y, r = circles[0][0]
 
-    # Беремо трохи БІЛЬШЕ ніж радіус — щоб точно виключити всю монету
     cv2.circle(coin_mask, (x, y), int(r * 1.15), 255, -1)
 
     ppm = (2 * r) / real_d_mm
