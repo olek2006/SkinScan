@@ -4,29 +4,17 @@ import numpy as np
 COIN_DIAMETER_MM = 23.5
 
 
-
-
 def remove_hair(image_bgr: np.ndarray):
-
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-
-
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
     blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-
-
     _, hair_mask = cv2.threshold(blackhat, 10, 255, cv2.THRESH_BINARY)
-
-
     hair_mask = cv2.dilate(
         hair_mask,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
         iterations=1
     )
-
-
     inpainted = cv2.inpaint(image_bgr, hair_mask, 3, cv2.INPAINT_TELEA)
-
     return inpainted, hair_mask
 
 
@@ -34,38 +22,39 @@ def kmeans_lesion_mask(image_bgr: np.ndarray) -> np.ndarray:
     h, w = image_bgr.shape[:2]
 
     blurred = cv2.GaussianBlur(image_bgr, (5, 5), 0)
-
     lab = cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
+
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_eq = clahe.apply(l)
+    lab = cv2.merge((l_eq, a, b))
+
     lab_reshaped = lab.reshape(-1, 3).astype(np.float32)
 
-    # K-means
-    K = 3
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
-    attempts = 5
-
-    _, labels, centers = cv2.kmeans(lab_reshaped,K,None,criteria,attempts,cv2.KMEANS_PP_CENTERS)
+    _, labels, centers = cv2.kmeans(
+        lab_reshaped,
+        3,
+        None,
+        (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0),
+        5,
+        cv2.KMEANS_PP_CENTERS
+    )
 
     labels = labels.reshape(h, w)
-    centers = centers.reshape(K, 3)
+    centers = centers.reshape(3, 3)
 
-
-    L_values = centers[:, 0]
-    order = np.argsort(L_values)
-
+    order = np.argsort(centers[:, 0])
     lesion_mask = np.zeros((h, w), dtype=np.uint8)
 
     for idx in order:
-        cluster_mask = (labels == idx).astype(np.uint8)
-        frac = cluster_mask.mean()
-
-
+        m = (labels == idx).astype(np.uint8)
+        frac = m.mean()
         if 0.01 < frac < 0.8:
-            lesion_mask = cluster_mask
+            lesion_mask = m
             break
 
     if lesion_mask.sum() == 0:
         lesion_mask = (labels == order[0]).astype(np.uint8)
-
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     lesion_mask = cv2.dilate(lesion_mask, kernel, iterations=1)
@@ -73,47 +62,75 @@ def kmeans_lesion_mask(image_bgr: np.ndarray) -> np.ndarray:
     return lesion_mask * 255
 
 
+def lesion_score(contour, img_shape):
+    H, W = img_shape[:2]
+
+    area = cv2.contourArea(contour)
+    if area < 400:
+        return -1
+
+    perimeter = cv2.arcLength(contour, True)
+    if perimeter == 0:
+        return -1
+
+    x, y, w, h = cv2.boundingRect(contour)
+
+    if x == 0 or y == 0 or x + w >= W or y + h >= H:
+        return -1
+
+    aspect = max(w, h) / max(1, min(w, h))
+    if aspect > 2.0:
+        return -1
+
+    extent = area / (w * h)
+    if extent > 0.85:
+        return -1
+
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    if hull_area == 0:
+        return -1
+
+    solidity = area / hull_area
+    if solidity < 0.9:
+        return -1
+
+    circularity = 4 * np.pi * area / (perimeter ** 2)
+    if circularity < 0.4:
+        return -1
+
+    approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+    if len(approx) < 8:
+        return -1
+
+    return circularity + solidity + (1 / aspect)
+
+
 def clean_lesion_mask(mask: np.ndarray) -> np.ndarray:
     mask = mask.copy().astype(np.uint8)
-
 
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     if not contours:
         return mask
 
-
-    valid = []
+    scored = []
     for c in contours:
-        area = cv2.contourArea(c)
-        if area < 300:
-            continue
+        s = lesion_score(c, mask.shape)
+        if s > 0:
+            scored.append((s, c))
 
-        x, y, w, h = cv2.boundingRect(c)
-        aspect_ratio = max(w, h) / max(1.0, min(w, h))
-
-
-        if aspect_ratio > 6 and area < 5000:
-            continue
-
-        valid.append(c)
-
-    if not valid:
+    if not scored:
         return np.zeros_like(mask)
 
+    _, best = max(scored, key=lambda x: x[0])
 
-    main = max(valid, key=cv2.contourArea)
-
-
-    hull = cv2.convexHull(main)
-
+    hull = cv2.convexHull(best)
     cleaned = np.zeros_like(mask)
-    cv2.drawContours(cleaned, [hull], -1, 255, thickness=-1)
-
+    cv2.drawContours(cleaned, [hull], -1, 255, -1)
 
     kernel2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     cleaned = cv2.dilate(cleaned, kernel2, iterations=1)
@@ -146,70 +163,36 @@ def detect_coin_ppm(image_bgr: np.ndarray, real_d_mm=COIN_DIAMETER_MM):
     x, y, r = circles[0][0]
 
     cv2.circle(coin_mask, (x, y), int(r * 1.15), 255, -1)
-
     ppm = (2 * r) / real_d_mm
+
     return ppm, r, coin_mask
 
 
 def overlay_mask(image_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-
-    overlay = image_bgr.copy()
     green = np.zeros_like(image_bgr)
     green[mask > 0] = (0, 255, 0)
-
-    blended = cv2.addWeighted(image_bgr, 0.7, green, 0.3, 0)
-    return blended
+    return cv2.addWeighted(image_bgr, 0.7, green, 0.3, 0)
 
 
 def analyze_image(image_path: str):
-    print(f"\n--- АНАЛІЗ ЗОБРАЖЕННЯ: {image_path} ---")
-
     img = cv2.imread(image_path)
     if img is None:
-        print("❌ Неможливо відкрити зображення.")
         return None
 
-
     img_no_hair, hair_mask = remove_hair(img)
-    print("✅ Волосся оброблено (inpaint).")
-
-
     raw_mask = kmeans_lesion_mask(img_no_hair)
-    print("✅ Початкова маска утворення отримана (k-means).")
 
-
-    raw_mask = kmeans_lesion_mask(img_no_hair)
-    print("✅ Початкова маска утворення отримана (k-means).")
-
-
-    ppm, radius_px, coin_mask = detect_coin_ppm(img)
-
-
+    ppm, _, coin_mask = detect_coin_ppm(img)
     if coin_mask is not None:
         raw_mask[coin_mask > 0] = 0
-        print("✅ Монета видалена з raw_mask")
-
 
     final_mask = clean_lesion_mask(raw_mask)
-    print("✅ Маска очищена й згладжена по краю (convex hull).")
-
 
     if coin_mask is not None:
         final_mask[coin_mask > 0] = 0
-        print("✅ Зона монети виключена з маски утворення")
-
 
     area_px = int(np.sum(final_mask > 0))
-    print(f"📏 Площа утворення (пікселі): {area_px}")
-
-
-    if ppm is not None:
-        area_mm2 = area_px / (ppm ** 2)
-        print(f"✨ Площа утворення: {area_mm2:.2f} мм²")
-    else:
-        area_mm2 = None
-        print("✨ Площу в мм² не вдалося обчислити (монета не знайдена).")
-
+    area_mm2 = area_px / (ppm ** 2) if ppm else None
 
     overlay = overlay_mask(img, final_mask)
 
@@ -224,5 +207,3 @@ def analyze_image(image_path: str):
         "ppm": ppm,
         "area_mm2": area_mm2,
     }
-
-
